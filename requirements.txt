@@ -1,0 +1,11 @@
+gradio
+langchain
+langchain-openai
+langchain-community
+langgraph
+python-dotenv
+psycopg[binary]>=3.2
+pgvector>=0.4
+pytest>=8
+rank-bm25>=0.2.2
+sqlalchemy>=2
