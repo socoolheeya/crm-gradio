@@ -22,6 +22,30 @@ class QueryOutput(TypedDict):
     query: Annotated[str, ..., "Syntactically valid read-only PostgreSQL query"]
 
 
+class AgentQueryError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
+
+
+def execute_read_only_query(db, query: str) -> str:
+    try:
+        safe_query = validate_read_only_sql(query)
+    except ValueError as error:
+        raise AgentQueryError(
+            "validation",
+            "생성된 SQL이 읽기 전용 정책을 충족하지 않습니다.",
+        ) from error
+
+    try:
+        return db.run(safe_query)
+    except Exception as error:
+        raise AgentQueryError(
+            "execution",
+            "CRM 데이터를 조회하는 중 오류가 발생했습니다.",
+        ) from error
+
+
 QUERY_PROMPT = ChatPromptTemplate.from_template("""
 Given an input question, create one syntactically correct read-only {dialect} SELECT query.
 Unless the user requests a specific count, limit the result to at most {top_k} rows.
@@ -37,6 +61,11 @@ Matching rules:
 - Prefer exact entity_name values shown above for filters.
 - Use only columns present in the schema.
 - Use PostgreSQL syntax.
+- When the question identifies a customer, filter by that exact customer_id and do not broaden the scope.
+- Resolve relative dates with CURRENT_DATE and PostgreSQL INTERVAL expressions.
+- Every selected non-aggregate column must appear in GROUP BY when aggregates are used.
+- Do not invent filters, entity values, joins, or date ranges that are not supported by the question or schema.
+- If a requested condition is ambiguous, use only the explicit conditions instead of guessing.
 - Return only a SELECT or WITH ... SELECT query.
 - Never generate INSERT, UPDATE, DELETE, DDL, COPY, or multiple statements.
 
@@ -76,8 +105,7 @@ def build_crm_agent(
         return {"query": validate_read_only_sql(result["query"])}
 
     def execute_query(state: AgentState):
-        safe_query = validate_read_only_sql(state["query"])
-        return {"result": db.run(safe_query)}
+        return {"result": execute_read_only_query(db, state["query"])}
 
     def generate_answer(state: AgentState):
         response = llm.invoke(

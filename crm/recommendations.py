@@ -1,6 +1,7 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from typing import Any
 
 
@@ -17,6 +18,22 @@ class Recommendation:
 
 
 WEIGHTS = {"purchase": 5, "add_to_cart": 4, "wishlist_add": 3, "product_view": 2, "search": 2}
+
+
+def validate_recommendation(recommendation: Recommendation) -> Recommendation:
+    for field in ("product_id", "product_name", "category", "action", "channel", "message"):
+        value = getattr(recommendation, field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field} must be a non-blank string")
+
+    score = recommendation.score
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not isfinite(score) or not 0 <= score <= 100:
+        raise ValueError("score must be a finite number between 0 and 100")
+
+    evidence = recommendation.evidence
+    if not evidence or any(not isinstance(reason, str) or not reason.strip() for reason in evidence):
+        raise ValueError("evidence must contain non-blank strings")
+    return recommendation
 
 
 def _action(events: list[dict[str, Any]]) -> tuple[str, tuple[str, ...]]:
@@ -37,6 +54,22 @@ def _action(events: list[dict[str, Any]]) -> tuple[str, tuple[str, ...]]:
     return "관심 상품 리마인드", ("최근 관심 행동을 기반으로 선정했습니다",)
 
 
+def _profile_bonus(product: dict[str, Any], events: list[dict[str, Any]], tags: set[str]) -> float:
+    grades = {event.get("membership_grade") for event in events}
+    price = float(product.get("product_price") or 0)
+    discount = float(product.get("discount_rate") or 0)
+    bonus = 0.0
+    if "VIP" in grades and price >= 100_000:
+        bonus += 2.5
+    elif "GOLD" in grades and price >= 100_000:
+        bonus += 1.0
+    if any(event.get("is_new_customer") for event in events) and discount >= 10:
+        bonus += 1.0
+    if "휴면위험" in tags and discount >= 10:
+        bonus += 1.5
+    return bonus
+
+
 def recommend_for_customer(events: list[dict[str, Any]], catalog_events: list[dict[str, Any]], limit: int = 3) -> list[Recommendation]:
     if not events:
         return []
@@ -44,6 +77,10 @@ def recommend_for_customer(events: list[dict[str, Any]], catalog_events: list[di
     preferred_categories = Counter(e.get("product_category") for e in events if e.get("product_category"))
     preferred = preferred_categories.most_common(1)[0][0] if preferred_categories else None
     tags = {tag for e in events for tag in (e.get("crm_tags") or [])}
+    purchased_ids = {
+        e.get("product_id") for e in events
+        if e.get("product_id") and (e.get("is_purchase") or e.get("event_type") == "purchase")
+    }
     channels = Counter(e.get("channel") for e in events if e.get("channel"))
     channel = channels.most_common(1)[0][0] if channels else "app"
     max_time = max((e.get("event_time") for e in events if isinstance(e.get("event_time"), datetime)), default=datetime.now())
@@ -51,7 +88,7 @@ def recommend_for_customer(events: list[dict[str, Any]], catalog_events: list[di
     products: dict[str, dict[str, Any]] = {}
     for e in events:
         pid = e.get("product_id")
-        if not pid:
+        if not pid or pid in purchased_ids:
             continue
         products[pid] = e
         weight = WEIGHTS.get(e.get("event_type"), 1)
@@ -61,13 +98,15 @@ def recommend_for_customer(events: list[dict[str, Any]], catalog_events: list[di
         scored[pid] += weight * max(0.5, 1 - age / 60)
     for e in catalog_events:
         pid = e.get("product_id")
-        if not pid:
+        if not pid or pid in purchased_ids:
+            continue
+        category_bonus = 2.0 if e.get("product_category") == preferred else 0.0
+        discount_bonus = float(e.get("discount_rate") or 0) / 10 if "할인민감" in tags else 0.0
+        profile_bonus = _profile_bonus(e, events, tags)
+        if category_bonus + discount_bonus + profile_bonus <= 0:
             continue
         products[pid] = e
-        if e.get("product_category") == preferred:
-            scored[pid] += 2
-        if "할인민감" in tags:
-            scored[pid] += float(e.get("discount_rate") or 0) / 10
+        scored[pid] += category_bonus + discount_bonus + profile_bonus
     if not scored:
         return []
     maximum = max(scored.values()) or 1
@@ -78,5 +117,7 @@ def recommend_for_customer(events: list[dict[str, Any]], catalog_events: list[di
         name = product.get("product_name") or pid
         category = product.get("product_category") or "기타"
         message = f"{category}에 관심을 보여주신 고객님께 {name}을 추천드립니다. 지금 혜택을 확인해 보세요."
-        results.append(Recommendation(pid, name, category, score, action, channel, base_evidence, message))
+        results.append(validate_recommendation(
+            Recommendation(pid, name, category, score, action, channel, base_evidence, message)
+        ))
     return results
