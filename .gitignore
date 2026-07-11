@@ -13,3 +13,7 @@ wheels/
 main.py
 uv.lock
 .python-version
+
+docs/
+
+.idea
